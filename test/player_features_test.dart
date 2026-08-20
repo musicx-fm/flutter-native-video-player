@@ -138,6 +138,29 @@ void main() {
     });
   });
 
+  group('load offlineDownloadId', () {
+    testWidgets('passes the opaque id and no url to the platform', (
+      tester,
+    ) async {
+      await attachView(tester);
+      await controller.loadOfflineDownload(id: 'track-123');
+
+      final call = calls.lastWhere((c) => c.method == 'load');
+      final arguments = call.arguments as Map;
+      expect(arguments['offlineDownloadId'], 'track-123');
+      expect(
+        arguments.containsKey('url'),
+        isFalse,
+        reason: 'offline loads must not hand a URL across the channel',
+      );
+    });
+
+    testWidgets('load rejects a call with neither url nor id', (tester) async {
+      await attachView(tester);
+      expect(() => controller.load(), throwsArgumentError);
+    });
+  });
+
   group('A-B playback range', () {
     testWidgets('loops back to start when reaching end', (tester) async {
       await attachView(tester);

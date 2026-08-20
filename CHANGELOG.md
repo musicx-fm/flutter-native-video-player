@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Offline DRM downloads (Android + iOS).** New plugin-level channels
+  `better_native_video_player/downloads` (methods: `startDownload`,
+  `cancelDownload`, `removeDownload`, `getDownloads`, `getLicenseInfo`,
+  `renewLicense`) and `better_native_video_player/download_events` (events:
+  `{id, status: queued|downloading|completed|failed|removed, fraction,
+  bytesDownloaded, error?}`).
+  - Android: in-process Media3 `DownloadManager` over a dedicated downloads
+    `SimpleCache` (separate from the streaming cache) with a persistent
+    `DownloadIndex`; persistent offline Widevine licenses via
+    `OfflineLicenseHelper` — the `keySetId` lives inside the download index
+    and never crosses the channel. Interrupted downloads resume at the next
+    plugin attach.
+  - iOS: background `AVAssetDownloadURLSession` delivering `.movpkg` bundles
+    (stored by home-relative path, excluded from iCloud backup) and
+    persistable FairPlay content keys via `AVContentKeySession`, persisted to
+    `Application Support/bnvp_offline_keys/`.
+- **Offline playback by opaque id:** `load(offlineDownloadId: ...)` /
+  `NativeVideoPlayerController.loadOfflineDownload(id: ...)` plays a completed
+  download with zero network (Android: read-only cache data source whose
+  upstream throws; iOS: local movpkg + persisted keys). iOS reports typed
+  errors `OFFLINE_DOWNLOAD_MISSING` / `OFFLINE_LICENSE_MISSING` /
+  `OFFLINE_LICENSE_EXPIRED` so callers can drive re-download or license
+  renewal.
+
 ### Fixed
 - **iOS FairPlay now generates a real SPC from the application certificate and
   HLS `skd://` content identifier.** Content key requests no longer fail when

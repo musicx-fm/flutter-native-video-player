@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.pm.ApplicationInfo
 import androidx.media3.common.util.UnstableApi
 import com.huddlecommunity.better_native_video_player.handlers.ControllerEventChannelHandler
+import com.huddlecommunity.better_native_video_player.manager.AssetDownloadManager
 import com.huddlecommunity.better_native_video_player.manager.SharedPlayerManager
 import com.huddlecommunity.better_native_video_player.manager.VideoCacheManager
 import io.flutter.embedding.engine.plugins.FlutterPlugin
@@ -307,8 +308,25 @@ class NativeVideoPlayerPlugin : FlutterPlugin, ActivityAware {
             }
         }
 
+        // Offline downloads: plugin-level channels (no viewId). Initializing
+        // here also resumes downloads interrupted by a previous process death.
+        val downloadsChannel =
+            MethodChannel(binding.binaryMessenger, "better_native_video_player/downloads")
+        downloadsChannel.setMethodCallHandler { call, result ->
+            AssetDownloadManager.handleMethodCall(applicationContext, call, result)
+        }
+        val downloadEventsChannel =
+            EventChannel(binding.binaryMessenger, "better_native_video_player/download_events")
+        downloadEventsChannel.setStreamHandler(AssetDownloadManager.eventStreamHandler)
+        this.downloadsChannel = downloadsChannel
+        this.downloadEventsChannel = downloadEventsChannel
+        AssetDownloadManager.initialize(applicationContext)
+
         NpLog.d(TAG, "NativeVideoPlayerPlugin registered with id: $VIEW_TYPE")
     }
+
+    private var downloadsChannel: MethodChannel? = null
+    private var downloadEventsChannel: EventChannel? = null
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         NpLog.d(TAG, "NativeVideoPlayerPlugin detached - cleaning up all players")
@@ -327,6 +345,14 @@ class NativeVideoPlayerPlugin : FlutterPlugin, ActivityAware {
         controllerEventChannels.values.forEach { it.setStreamHandler(null) }
         controllerEventChannels.clear()
         messenger = null
+
+        // Downloads channels are engine-scoped; the AssetDownloadManager
+        // itself is process-lifetime (its SimpleCache cannot be reopened) and
+        // keeps any active downloads running across a hot restart.
+        downloadsChannel?.setMethodCallHandler(null)
+        downloadsChannel = null
+        downloadEventsChannel?.setStreamHandler(null)
+        downloadEventsChannel = null
 
         // Clean up all shared players when the Flutter engine is detached
         // This ensures players are properly disposed when the app is closed/terminated

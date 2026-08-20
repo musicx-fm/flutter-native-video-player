@@ -191,6 +191,11 @@ import QuartzCore
     // DRM handler for protected content
     var drmHandler: VideoPlayerDrmHandler?
 
+    // Playback-mode key manager for offline downloads: answers FairPlay key
+    // requests from persisted key blobs (no network). Retained for the
+    // lifetime of the loaded offline item.
+    var offlineKeyManager: PersistableKeyManager?
+
 
     public init(
         frame: CGRect,

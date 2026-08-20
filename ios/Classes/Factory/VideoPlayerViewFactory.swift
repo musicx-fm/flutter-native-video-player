@@ -181,6 +181,23 @@ import UIKit
             }
         }
 
+        // Offline downloads: plugin-level channels (no viewId), mirroring the
+        // Android AssetDownloadManager. Registering also reattaches to
+        // download tasks that survived a relaunch in the background session.
+        let downloadsChannel = FlutterMethodChannel(
+            name: "better_native_video_player/downloads",
+            binaryMessenger: registrar.messenger()
+        )
+        downloadsChannel.setMethodCallHandler { call, result in
+            AssetDownloadHandler.shared.handle(call, result: result)
+        }
+        let downloadEventsChannel = FlutterEventChannel(
+            name: "better_native_video_player/download_events",
+            binaryMessenger: registrar.messenger()
+        )
+        downloadEventsChannel.setStreamHandler(AssetDownloadHandler.shared)
+        AssetDownloadHandler.shared.restorePendingTasks()
+
         // Register asset resolution channel
         let assetChannel = FlutterMethodChannel(name: "native_video_player/assets", binaryMessenger: registrar.messenger())
         assetChannel.setMethodCallHandler { (call: FlutterMethodCall, result: @escaping FlutterResult) in

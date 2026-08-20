@@ -6,7 +6,6 @@ import android.os.Handler
 import android.os.Looper
 import androidx.media3.common.MediaItem
 import androidx.media3.common.util.UnstableApi
-import androidx.media3.database.StandaloneDatabaseProvider
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.DefaultHttpDataSource
@@ -64,7 +63,7 @@ object VideoCacheManager {
             val created = SimpleCache(
                 File(context.applicationContext.cacheDir, CACHE_DIR_NAME),
                 LeastRecentlyUsedCacheEvictor(maxBytes),
-                StandaloneDatabaseProvider(context.applicationContext)
+                Media3DatabaseProvider.get(context)
             )
             cache = created
             NpLog.d(TAG, "Disk cache created (max ${maxBytes / (1024 * 1024)}MB)")

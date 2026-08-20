@@ -32,6 +32,7 @@ import io.flutter.plugin.common.MethodChannel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import com.huddlecommunity.better_native_video_player.manager.AssetDownloadManager
 import com.huddlecommunity.better_native_video_player.manager.SharedPlayerManager
 import com.huddlecommunity.better_native_video_player.manager.VideoCacheManager
 
@@ -77,9 +78,15 @@ class VideoPlayerMethodHandler(
     }
 
     /**
-     * Wraps [upstream] with the shared disk cache when enabled. DRM streams
-     * and non-http sources (file://, content://, extracted assets) always
-     * bypass the cache.
+     * Wraps [upstream] with the shared *streaming* disk cache when enabled.
+     * Non-http sources (file://, content://, extracted assets) bypass it.
+     *
+     * DRM streams also bypass THIS cache, but the invariant is narrower than
+     * "DRM is never cached": CDM output (decrypted media) must never touch
+     * disk, while still-encrypted segments may live in the separate downloads
+     * cache owned by [AssetDownloadManager] — that is what offline DRM
+     * playback reads from. The streaming cache stays DRM-free simply because
+     * transient streaming entries of protected content have no reuse value.
      */
     private fun maybeWrapWithCache(
         upstream: DataSource.Factory,
@@ -242,8 +249,16 @@ class VideoPlayerMethodHandler(
      */
     private fun handleLoad(call: MethodCall, result: MethodChannel.Result) {
         val args = call.arguments as? Map<*, *>
-        val url = args?.get("url") as? String
 
+        // Offline downloads are loaded by opaque id — no URL crosses the
+        // channel for them (compliance: no asset-URL handoff).
+        val offlineDownloadId = args?.get("offlineDownloadId") as? String
+        if (offlineDownloadId != null) {
+            handleOfflineLoad(offlineDownloadId, args, result)
+            return
+        }
+
+        val url = args?.get("url") as? String
         if (url == null) {
             result.error("INVALID_URL", "URL is required", null)
             return
@@ -300,9 +315,11 @@ class VideoPlayerMethodHandler(
         } else {
             DefaultDataSource.Factory(context)
         }
-        // Opt-in disk cache wrap. hasDrm mirrors the condition under which a
-        // DrmConfiguration is set on the MediaItem below — protected content
-        // must never be written to the cache.
+        // Opt-in streaming cache wrap. hasDrm mirrors the condition under
+        // which a DrmConfiguration is set on the MediaItem below. Note the
+        // invariant: never cache CDM output; encrypted segments of protected
+        // content may still live in the AssetDownloadManager downloads cache
+        // (offline downloads) — just not in this streaming cache.
         val hasDrm = drmConfig?.get("licenseUrl") != null
         val finalDataSourceFactory =
             maybeWrapWithCache(upstreamDataSourceFactory, url, hasDrm)
@@ -416,7 +433,15 @@ class VideoPlayerMethodHandler(
         // NOTE: Media session will be set up when playback starts (in VideoPlayerObserver)
         // This ensures the correct video's metadata is displayed even when switching between videos
 
-        // Wait for player to be ready
+        completeWhenReady(autoPlay, result)
+    }
+
+    /**
+     * Completes [result] once the freshly prepared media reaches STATE_READY
+     * (starting playback first when [autoPlay]), or fails it on player error.
+     * Shared tail of the online and offline load paths.
+     */
+    private fun completeWhenReady(autoPlay: Boolean, result: MethodChannel.Result) {
         val listener = object : androidx.media3.common.Player.Listener {
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (playbackState == androidx.media3.common.Player.STATE_READY) {
@@ -444,6 +469,90 @@ class VideoPlayerMethodHandler(
             }
         }
         player.addListener(listener)
+    }
+
+    /**
+     * Loads a completed offline download for playback.
+     *
+     * The MediaItem is rebuilt from the stored DownloadRequest — including its
+     * `keySetId`, which DefaultDrmSessionManagerProvider restores in
+     * MODE_PLAYBACK (offline Widevine license, no license-server round-trip).
+     * Media is read exclusively from the downloads cache through a read-only
+     * factory whose upstream throws, so offline playback can never touch the
+     * network.
+     */
+    private fun handleOfflineLoad(
+        downloadId: String,
+        args: Map<*, *>,
+        result: MethodChannel.Result
+    ) {
+        val autoPlay = args["autoPlay"] as? Boolean ?: false
+        val mediaInfo = args["mediaInfo"] as? Map<String, Any>
+        val startAtMs = (args["startAtMs"] as? Number)?.toLong() ?: 0L
+
+        updateMediaInfo?.invoke(mediaInfo)
+
+        val download = AssetDownloadManager.getCompletedDownload(context, downloadId)
+        if (download == null) {
+            result.error(
+                "OFFLINE_DOWNLOAD_MISSING",
+                "No completed offline download for id $downloadId",
+                null
+            )
+            return
+        }
+
+        NpLog.d(TAG, "Loading offline download: $downloadId")
+        eventHandler.sendEvent("loading")
+
+        val request = download.request
+        currentVideoIsHls =
+            request.mimeType == MimeTypes.APPLICATION_M3U8 || isHlsUrl(request.uri.toString())
+
+        val mediaItemBuilder = MediaItem.Builder()
+            .setMediaId(request.id)
+            .setUri(request.uri)
+            .setCustomCacheKey(request.customCacheKey)
+            .setMimeType(request.mimeType)
+            .setStreamKeys(request.streamKeys)
+
+        if (mediaInfo != null) {
+            val metadataBuilder = androidx.media3.common.MediaMetadata.Builder()
+            (mediaInfo["title"] as? String)?.let { metadataBuilder.setTitle(it) }
+            (mediaInfo["subtitle"] as? String)?.let { metadataBuilder.setArtist(it) }
+            (mediaInfo["album"] as? String)?.let { metadataBuilder.setAlbumTitle(it) }
+            mediaItemBuilder.setMediaMetadata(metadataBuilder.build())
+        }
+
+        request.keySetId?.let { keySetId ->
+            mediaItemBuilder.setDrmConfiguration(
+                MediaItem.DrmConfiguration.Builder(C.WIDEVINE_UUID)
+                    .setKeySetId(keySetId)
+                    .build()
+            )
+        }
+
+        val mediaItem = mediaItemBuilder.build()
+        val dataSourceFactory = try {
+            AssetDownloadManager.buildOfflinePlaybackDataSourceFactory()
+        } catch (e: IllegalStateException) {
+            result.error("OFFLINE_DOWNLOAD_MISSING", e.message, null)
+            return
+        }
+
+        lastMediaItem = mediaItem
+        lastDataSourceFactory = dataSourceFactory
+        sidecarSubtitleConfigs = parseSidecarSubtitleConfigs(args["sidecarSubtitles"] as? List<*>)
+
+        val mediaSource = buildMediaSourceWithSidecars(mediaItem, dataSourceFactory)
+        if (startAtMs > 0) {
+            player.setMediaSource(mediaSource, startAtMs)
+        } else {
+            player.setMediaSource(mediaSource)
+        }
+        player.prepare()
+
+        completeWhenReady(autoPlay, result)
     }
 
     /**

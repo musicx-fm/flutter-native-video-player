@@ -240,6 +240,10 @@ class NativeVideoPlayerController {
   Map<String, String>? _lastLoadHeaders;
   Map<String, dynamic>? _lastLoadDrmConfig;
 
+  /// Offline download id of the last [load] call (offline loads have no URL);
+  /// retained for the same eviction re-load purpose.
+  String? _lastLoadOfflineDownloadId;
+
   /// Method channel wrapper for platform communication
   VideoPlayerMethodChannel? _methodChannel;
 
@@ -983,7 +987,8 @@ class NativeVideoPlayerController {
   /// next [play] retries.
   Future<void> _reloadEvictedSource() async {
     final source = _url;
-    if (source == null) {
+    final offlineDownloadId = _lastLoadOfflineDownloadId;
+    if (source == null && offlineDownloadId == null) {
       // Nothing was ever loaded, so there is nothing to restore.
       _needsReloadAfterEviction = false;
       return;
@@ -999,6 +1004,7 @@ class NativeVideoPlayerController {
         url: source,
         headers: _lastLoadHeaders,
         drmConfig: _lastLoadDrmConfig,
+        offlineDownloadId: offlineDownloadId,
         startAt: _evictionResumePosition,
         force: true,
       );
@@ -1216,9 +1222,7 @@ class NativeVideoPlayerController {
 
     if (style.embeddedTextScale != _embeddedTextScale) {
       _embeddedTextScale = style.embeddedTextScale;
-      unawaited(
-        _methodChannel?.setEmbeddedTextScale(style.embeddedTextScale),
-      );
+      unawaited(_methodChannel?.setEmbeddedTextScale(style.embeddedTextScale));
     }
   }
 
@@ -1461,14 +1465,23 @@ class NativeVideoPlayerController {
   /// [force] loads even when the current state is `loaded` (the guard that
   /// prevents accidental double-loads). Use it to replace the current video
   /// with a different one, e.g. for playlist advancement.
+  ///
+  /// Instead of [url], pass [offlineDownloadId] to play a completed offline
+  /// download (started through the `better_native_video_player/downloads`
+  /// channel) — the id is opaque and no URL crosses the platform channel.
+  /// See also [loadOfflineDownload].
   Future<void> load({
-    required String url,
+    String? url,
     Map<String, String>? headers,
     Map<String, dynamic>? drmConfig,
     List<NativeVideoPlayerSidecarSubtitle>? sidecarSubtitles,
     Duration? startAt,
     bool force = false,
+    String? offlineDownloadId,
   }) async {
+    if (url == null && offlineDownloadId == null) {
+      throw ArgumentError('Either url or offlineDownloadId must be provided');
+    }
     if (!force && _state.activityState.isLoaded) {
       return;
     }
@@ -1491,6 +1504,7 @@ class NativeVideoPlayerController {
     // Retained for the eviction re-load (see _reloadEvictedSource).
     _lastLoadHeaders = headers;
     _lastLoadDrmConfig = drmConfig;
+    _lastLoadOfflineDownloadId = offlineDownloadId;
 
     // An A-B range only makes sense for the video it was set on.
     _playbackRange = null;
@@ -1511,6 +1525,7 @@ class NativeVideoPlayerController {
         // non-URL sources render through the Flutter overlay only.
         sidecarSubtitles: _androidSidecarMaps(sidecarSubtitles),
         startAtMs: startAt?.inMilliseconds,
+        offlineDownloadId: offlineDownloadId,
       );
 
       // Re-apply the embedded caption text scale to the fresh player item.
@@ -1635,6 +1650,26 @@ class NativeVideoPlayerController {
     // Construct file:// URI if not already provided
     final fileUrl = path.startsWith('file://') ? path : 'file://$path';
     return load(url: fileUrl);
+  }
+
+  /// Loads a completed offline download for playback.
+  ///
+  /// [id] is the download id used with the
+  /// `better_native_video_player/downloads` channel (Android: Media3
+  /// DownloadManager over the downloads cache; iOS: downloaded `.movpkg`).
+  /// The offline DRM license persisted at download time is restored natively;
+  /// playback never touches the network.
+  ///
+  /// Throws a [PlatformException] with code `OFFLINE_DOWNLOAD_MISSING`,
+  /// `OFFLINE_LICENSE_MISSING`, or `OFFLINE_LICENSE_EXPIRED` (iOS reports the
+  /// license codes; Android surfaces license problems as playback errors) so
+  /// callers can drive re-download or license renewal.
+  Future<void> loadOfflineDownload({
+    required String id,
+    Duration? startAt,
+    bool force = false,
+  }) async {
+    return load(offlineDownloadId: id, startAt: startAt, force: force);
   }
 
   /// Starts or resumes video playback

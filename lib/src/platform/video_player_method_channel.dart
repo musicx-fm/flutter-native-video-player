@@ -59,21 +59,33 @@ class VideoPlayerMethodChannel {
     }
   }
 
-  /// Loads a video URL
+  /// Loads a video URL, or — when [offlineDownloadId] is set — a completed
+  /// offline download by its opaque id (no URL crosses the channel for
+  /// offline content).
   Future<void> load({
-    required String url,
+    String? url,
     required bool autoPlay,
     Map<String, String>? headers,
     Map<String, dynamic>? mediaInfo,
     Map<String, dynamic>? drmConfig,
     List<Map<String, dynamic>>? sidecarSubtitles,
     int? startAtMs,
+    String? offlineDownloadId,
   }) async {
+    assert(
+      url != null || offlineDownloadId != null,
+      'Either url or offlineDownloadId must be provided',
+    );
     final Map<String, Object> params = <String, Object>{
-      'url': url,
       'autoPlay': autoPlay,
       'viewId': primaryPlatformViewId,
     };
+
+    if (offlineDownloadId != null) {
+      params['offlineDownloadId'] = offlineDownloadId;
+    } else if (url != null) {
+      params['url'] = url;
+    }
 
     if (headers != null) {
       params['headers'] = headers;
@@ -196,11 +208,10 @@ class VideoPlayerMethodChannel {
   /// tracks. 1.0 = platform default. Issue #43.
   Future<void> setEmbeddedTextScale(double scale) async {
     try {
-      await _methodChannel
-          .invokeMethod<void>('setEmbeddedTextScale', <String, Object>{
-        'viewId': primaryPlatformViewId,
-        'scale': scale,
-      });
+      await _methodChannel.invokeMethod<void>(
+        'setEmbeddedTextScale',
+        <String, Object>{'viewId': primaryPlatformViewId, 'scale': scale},
+      );
     } catch (e) {
       debugPrint('Error calling setEmbeddedTextScale: $e');
     }

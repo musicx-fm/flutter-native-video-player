@@ -11,8 +11,19 @@ extension VideoPlayerView {
     func handleLoad(call: FlutterMethodCall, result: @escaping FlutterResult) {
         npLog("handleLoad called with arguments: \(String(describing: call.arguments))")
 
-        guard let arguments = call.arguments as? [String: Any],
-              let urlString = arguments["url"] as? String,
+        guard let arguments = call.arguments as? [String: Any] else {
+            result(FlutterError(code: "INVALID_URL", message: "Invalid URL provided", details: nil))
+            return
+        }
+
+        // Offline downloads are loaded by opaque id — no URL crosses the
+        // channel for them (compliance: no asset-URL handoff).
+        if let offlineDownloadId = arguments["offlineDownloadId"] as? String {
+            handleOfflineLoad(downloadId: offlineDownloadId, arguments: arguments, result: result)
+            return
+        }
+
+        guard let urlString = arguments["url"] as? String,
               let url = URL(string: urlString)
         else {
             let error = FlutterError(code: "INVALID_URL", message: "Invalid URL provided", details: nil)
@@ -130,16 +141,19 @@ extension VideoPlayerView {
         }
 
         // --- Build player item ---
-        let playerItem: AVPlayerItem
         let asset: AVURLAsset
-        
+
         // Create asset with headers if provided
         if let headers = headers {
             asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
         } else {
             asset = AVURLAsset(url: url)
         }
-        
+
+        // Online loads use the streaming DRM handler; drop any offline key
+        // manager left over from a previously loaded offline item.
+        offlineKeyManager = nil
+
         // Setup DRM if configured
         if let drmConfig = drmConfig {
             // Clean up existing DRM handler if any
@@ -159,8 +173,109 @@ extension VideoPlayerView {
                 }
             }
         }
-        
-        playerItem = AVPlayerItem(asset: asset)
+
+        loadPlayerItem(asset: asset, autoPlay: autoPlay, startAtMs: startAtMs, result: result)
+    }
+
+    /// Loads a completed offline download (encrypted movpkg + persisted
+    /// FairPlay keys) for playback. Fails with typed errors so the Dart side
+    /// can drive license renewal:
+    /// - `OFFLINE_DOWNLOAD_MISSING`: id unknown or asset gone
+    /// - `OFFLINE_LICENSE_MISSING`: a persisted key blob is missing
+    /// - `OFFLINE_LICENSE_EXPIRED`: the backend-reported expiry has passed
+    func handleOfflineLoad(
+        downloadId: String,
+        arguments: [String: Any],
+        result: @escaping FlutterResult
+    ) {
+        if let controllerIdValue = controllerId {
+            // Same evicted-player recovery as the online path (see handleLoad).
+            if player == nil {
+                let (revivedPlayer, _) = SharedPlayerManager.shared.getOrCreatePlayer(for: controllerIdValue)
+                player = revivedPlayer
+
+                if usesLightView {
+                    lightView?.playerLayer.player = revivedPlayer
+                } else if usesViewControllerDisplay {
+                    playerViewController.player = revivedPlayer
+                }
+
+                SharedPlayerManager.shared.registerVideoPlayerView(self, viewId: viewId)
+                npLog("♻️ Re-acquired shared player after LRU eviction for controller \(controllerIdValue)")
+            }
+            SharedPlayerManager.shared.touchController(controllerIdValue)
+        }
+
+        let autoPlay = arguments["autoPlay"] as? Bool ?? false
+        let startAtMs = arguments["startAtMs"] as? Int ?? 0
+
+        // New media starts in Auto: clear any manual-quality pin.
+        manualQualitySelected = false
+
+        if let mediaInfo = arguments["mediaInfo"] as? [String: Any] {
+            currentMediaInfo = mediaInfo
+            if let controllerIdValue = controllerId {
+                SharedPlayerManager.shared.setMediaInfo(for: controllerIdValue, mediaInfo: mediaInfo)
+            }
+        }
+
+        guard let assetURL = AssetDownloadHandler.shared.completedAssetURL(for: downloadId) else {
+            result(FlutterError(
+                code: "OFFLINE_DOWNLOAD_MISSING",
+                message: "No completed offline download for id \(downloadId)",
+                details: nil
+            ))
+            return
+        }
+
+        switch AssetDownloadHandler.shared.licenseState(for: downloadId) {
+        case .missing:
+            result(FlutterError(
+                code: "OFFLINE_LICENSE_MISSING",
+                message: "Offline license for \(downloadId) is missing",
+                details: nil
+            ))
+            return
+        case .expired:
+            result(FlutterError(
+                code: "OFFLINE_LICENSE_EXPIRED",
+                message: "Offline license for \(downloadId) has expired",
+                details: nil
+            ))
+            return
+        case .clear, .valid:
+            break
+        }
+
+        npLog("🎬 Loading offline download \(downloadId) from \(assetURL.lastPathComponent)")
+        sendEvent("loading")
+
+        let asset = AVURLAsset(url: assetURL)
+
+        // Answer FairPlay key requests from the persisted blobs — never the
+        // network. The manager must be retained for the item's lifetime.
+        drmHandler?.cleanup()
+        drmHandler = nil
+        if AssetDownloadHandler.shared.hasPersistedKeys(for: downloadId) {
+            let keyManager = PersistableKeyManager(mode: .playback)
+            keyManager.attach(to: asset)
+            offlineKeyManager = keyManager
+        } else {
+            offlineKeyManager = nil
+        }
+
+        loadPlayerItem(asset: asset, autoPlay: autoPlay, startAtMs: startAtMs, result: result)
+    }
+
+    /// Shared tail of the online and offline load paths: builds the player
+    /// item, wires observers, and completes [result] once the item is ready.
+    func loadPlayerItem(
+        asset: AVURLAsset,
+        autoPlay: Bool,
+        startAtMs: Int,
+        result: @escaping FlutterResult
+    ) {
+        let playerItem = AVPlayerItem(asset: asset)
 
         // Optional buffer tuning from NativeVideoPlayerConfig (0/default =
         // AVPlayer decides automatically)

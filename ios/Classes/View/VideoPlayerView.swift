@@ -187,6 +187,11 @@ import QuartzCore
     // Track if app is in background to keep audio playing on screen lock
     var isInBackground: Bool = false
     var lastKnownRate: Float = 0.0
+
+    // Activating a non-mixable .playback session stops other apps' audio, so
+    // only lifecycle paths reached while this player is playing may activate it.
+    var isPlaybackActive: Bool { (player?.rate ?? 0) != 0 }
+    private var wasPlayingBeforeInterruption = false
     
     // DRM handler for protected content
     var drmHandler: VideoPlayerDrmHandler?
@@ -1162,18 +1167,18 @@ import QuartzCore
         // Store current playback rate before iOS might pause it
         let wasPlaying = player?.rate ?? 0 > 0
 
-        // CRITICAL: Ensure audio session stays active when screen locks
-        // This prevents iOS from pausing the video
-        do {
-            try AVAudioSession.sharedInstance().setActive(true)
-            npLog("   → Audio session kept active during background/lock")
-        } catch {
-            npLog("   ⚠️ Failed to keep audio session active: \(error.localizedDescription)")
-        }
-
         // CRITICAL: iOS will pause AVPlayer when screen locks
         // We need to resume playback to continue audio in background
         if wasPlaying {
+            // CRITICAL: Ensure audio session stays active when screen locks
+            // This prevents iOS from pausing the video
+            do {
+                try AVAudioSession.sharedInstance().setActive(true)
+                npLog("   → Audio session kept active during background/lock")
+            } catch {
+                npLog("   ⚠️ Failed to keep audio session active: \(error.localizedDescription)")
+            }
+
             // Small delay to ensure background transition completes
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
                 guard let self = self, let player = self.player else { return }
@@ -1193,12 +1198,13 @@ import QuartzCore
     @objc func handleAppWillEnterForeground() {
         npLog("📱 App entering foreground - restoring Now Playing info for view \(viewId)")
 
-        // CRITICAL: Reactivate audio session first
-        do {
-            try AVAudioSession.sharedInstance().setActive(true)
-            npLog("   → Audio session reactivated")
-        } catch {
-            npLog("   ⚠️ Failed to reactivate audio session: \(error.localizedDescription)")
+        if isPlaybackActive {
+            do {
+                try AVAudioSession.sharedInstance().setActive(true)
+                npLog("   → Audio session reactivated")
+            } catch {
+                npLog("   ⚠️ Failed to reactivate audio session: \(error.localizedDescription)")
+            }
         }
 
         // Check if this view owns the remote commands
@@ -1249,8 +1255,12 @@ import QuartzCore
         switch type {
         case .began:
             npLog("   → Audio session interrupted, Now Playing info may be cleared")
+            wasPlayingBeforeInterruption = isPlaybackActive
 
         case .ended:
+            let resumeAllowed = wasPlayingBeforeInterruption
+            wasPlayingBeforeInterruption = false
+
             // Check if we should resume playback
             var shouldResume = false
             if let optionsValue = userInfo[AVAudioSessionInterruptionOptionKey] as? UInt {
@@ -1261,12 +1271,18 @@ import QuartzCore
                 }
             }
 
-            // Reactivate audio session
-            do {
-                try AVAudioSession.sharedInstance().setActive(true)
-                npLog("   → Audio session reactivated")
-            } catch {
-                npLog("   ⚠️ Failed to reactivate audio session: \(error.localizedDescription)")
+            if !resumeAllowed {
+                shouldResume = false
+                npLog("   → Player was not playing before the interruption, not resuming")
+            }
+
+            if shouldResume {
+                do {
+                    try AVAudioSession.sharedInstance().setActive(true)
+                    npLog("   → Audio session reactivated")
+                } catch {
+                    npLog("   ⚠️ Failed to reactivate audio session: \(error.localizedDescription)")
+                }
             }
 
             // Restore Now Playing info and resume playback if needed

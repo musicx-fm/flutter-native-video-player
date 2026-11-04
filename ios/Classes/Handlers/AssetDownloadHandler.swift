@@ -331,18 +331,20 @@ final class AssetDownloadHandler: NSObject {
 
     private func resolvedLocation(for entry: DownloadEntry) -> URL? {
         guard let relativePath = entry.relativePath else { return nil }
-        let url = URL(fileURLWithPath: NSHomeDirectory())
-            .appendingPathComponent(relativePath)
+        let url = relativePath.hasPrefix("/")
+            ? URL(fileURLWithPath: relativePath)
+            : URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(relativePath)
         return FileManager.default.fileExists(atPath: url.path) ? url : nil
     }
 
+    // Both sides are symlink-resolved: the system can report the location
+    // under /private/var while NSHomeDirectory() is /var, so a plain prefix
+    // check misses and the absolute path would be re-anchored onto home.
     private func relativePath(for location: URL) -> String {
-        let home = NSHomeDirectory()
-        let path = location.path
-        if path.hasPrefix(home) {
-            return String(path.dropFirst(home.count)).trimmingCharacters(
-                in: CharacterSet(charactersIn: "/")
-            )
+        let home = URL(fileURLWithPath: NSHomeDirectory()).resolvingSymlinksInPath().path
+        let path = location.resolvingSymlinksInPath().path
+        if path.hasPrefix(home + "/") {
+            return String(path.dropFirst(home.count + 1))
         }
         return path
     }
@@ -470,7 +472,9 @@ extension AssetDownloadHandler: AVAssetDownloadDelegate {
         // Called before didCompleteWithError, including for failures (the
         // partial movpkg is delivered too); the entry only flips to completed
         // in didCompleteWithError.
-        index[id]?.relativePath = relativePath(for: location)
+        let stored = relativePath(for: location)
+        npLog("📥 Offline: \(id) delivered to \(location.absoluteString) (path: \(location.path), base: \(location.baseURL?.path ?? "nil"), home: \(NSHomeDirectory()), stored: \(stored), exists: \(FileManager.default.fileExists(atPath: location.path)))")
+        index[id]?.relativePath = stored
         saveIndex()
     }
 
@@ -507,6 +511,7 @@ extension AssetDownloadHandler: AVAssetDownloadDelegate {
         }
 
         guard let location = resolvedLocation(for: entry) else {
+            npLog("📥 Offline: \(id) finished without a resolvable asset (stored: \(entry.relativePath ?? "nil"))")
             index.removeValue(forKey: id)
             saveIndex()
             sendEvent([

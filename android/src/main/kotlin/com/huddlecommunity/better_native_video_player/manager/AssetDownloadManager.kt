@@ -18,6 +18,7 @@ import androidx.media3.exoplayer.offline.DownloadHelper
 import androidx.media3.exoplayer.offline.DownloadManager
 import androidx.media3.exoplayer.scheduler.Requirements
 import com.huddlecommunity.better_native_video_player.NpLog
+import com.huddlecommunity.better_native_video_player.drm.HlsDrmInitDataLoader
 import com.huddlecommunity.better_native_video_player.drm.OfflineWidevineLicenseManager
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
@@ -247,7 +248,7 @@ object AssetDownloadManager {
                     preparedHelper.release()
                     return
                 }
-                downloadLicenseAndEnqueue(manager, preparedHelper, id, drm)
+                downloadLicenseAndEnqueue(manager, preparedHelper, id, url, headers, drm)
             }
 
             override fun onPrepareError(preparedHelper: DownloadHelper, e: IOException) {
@@ -275,6 +276,8 @@ object AssetDownloadManager {
         manager: DownloadManager,
         helper: DownloadHelper,
         id: String,
+        url: String,
+        headers: Map<String, String>?,
         drm: Map<*, *>
     ) {
         val licenseUrl = drm["licenseUrl"] as? String
@@ -292,22 +295,13 @@ object AssetDownloadManager {
             )
             return
         }
-        val format = firstFormatWithDrmInitData(helper)
-        if (format == null) {
-            helper.release()
-            sendEvent(
-                mapOf(
-                    "id" to id,
-                    "status" to "failed",
-                    "bytesDownloaded" to 0L,
-                    "error" to "Content has no DRM protection (no drmInitData found)"
-                )
-            )
-            return
-        }
+        val manifestFormat = firstFormatWithDrmInitData(helper)
         licenseFetchesInFlight.add(id)
         licenseExecutor.execute {
             try {
+                val format = manifestFormat
+                    ?: HlsDrmInitDataLoader.load(url, headers)
+                    ?: throw NoDrmInitDataException()
                 val keySetId =
                     OfflineWidevineLicenseManager.downloadLicense(format, licenseUrl, drmHeaders)
                 mainHandler.post {
@@ -328,6 +322,11 @@ object AssetDownloadManager {
                 }
             } catch (e: Exception) {
                 NpLog.e(TAG, "Offline license download failed for $id: ${e.message}", e)
+                val error = if (e is NoDrmInitDataException) {
+                    e.message
+                } else {
+                    "License download failed: ${e.message}"
+                }
                 mainHandler.post {
                     licenseFetchesInFlight.remove(id)
                     canceledDuringLicenseFetch.remove(id)
@@ -337,7 +336,7 @@ object AssetDownloadManager {
                             "id" to id,
                             "status" to "failed",
                             "bytesDownloaded" to 0L,
-                            "error" to "License download failed: ${e.message}"
+                            "error" to error
                         )
                     )
                 }
@@ -584,3 +583,6 @@ object AssetDownloadManager {
         }
     }
 }
+
+private class NoDrmInitDataException :
+    IOException("Content has no DRM protection (no drmInitData found)")
